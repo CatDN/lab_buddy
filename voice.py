@@ -1,98 +1,119 @@
-# 14/03/2026
-##############################################################
-# Sources:
-# - https://ai.google.dev/gemini-api/docs/audio?_gl=1*1kq0tbd*_up*MQ..*_ga*MTcyMTk3MzM4My4xNzczNDgxODk2*_ga_P1DBVKWT6V*czE3NzM0ODQ2ODAkbzIkZzAkdDE3NzM0ODQ2ODAkajYwJGwwJGgxODc2MzE0MjAw
+# 21/03/2026
 
-##############################################################
-# for the API key
-from dotenv import load_dotenv
-import os
-
-# for the agent
-from google import genai
-from google.genai import types
-import json
-
-# for the voice
+import asyncio
 import pyaudio
-import wave
-import io
+import base64
+import os
+import threading
+from dotenv import load_dotenv
+from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
 
 load_dotenv()
 
-# the agent
-model =  os.getenv("MODEL")
-
 SAMPLE_RATE = 16000
-CHANNELS = 1
-CHUNK = 1024
-DURATION = int(os.getenv("DURATION"))  # seconds to record
+CHUNK = 1600
+COMMIT_INTERVAL = 5
 
-def record_audio():
+latest_transcript = ""
+_connection = None
+_loop = None
+
+async def _stream():
+    global latest_transcript, _connection
+
+    elevenlabs = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+
+    _connection = await elevenlabs.speech_to_text.realtime.connect(
+        RealtimeAudioOptions(
+            model_id="scribe_v2_realtime",
+            audio_format=AudioFormat.PCM_16000,
+            sample_rate=SAMPLE_RATE,
+            commit_strategy=CommitStrategy.MANUAL,
+        )
+    )
+    print("ElevenLabs connected")
+
+    def on_partial(data):
+        global latest_transcript
+        text = data.get("text", "")
+        if text:
+            latest_transcript = text
+
+    def on_committed(data):
+        global latest_transcript
+        text = data.get("text", "")
+        if text:
+            latest_transcript = text
+            print(f"Committed: {latest_transcript}")
+
+    _connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, on_partial)
+    _connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, on_committed)
+    _connection.on(RealtimeEvents.ERROR, lambda e: print(f"ElevenLabs error: {e}"))
+    _connection.on(RealtimeEvents.CLOSE, lambda: print("ElevenLabs connection closed"))
+
     p = pyaudio.PyAudio()
-
     stream = p.open(
-        format =pyaudio.paInt16,
-        channels= CHANNELS,
+        format=pyaudio.paInt16,
+        channels=1,
         rate=SAMPLE_RATE,
         input=True,
         frames_per_buffer=CHUNK
     )
 
-    print("Listening...")
+    last_commit = asyncio.get_event_loop().time()
+    is_first = True
 
-    frames= []
-    for _ in range(0, int(SAMPLE_RATE/CHUNK * DURATION)):
-        frames.append(stream.read(CHUNK))
+    try:
+        while True:
+            chunk = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: stream.read(CHUNK, exception_on_overflow=False)
+            )
 
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+            payload = {"audio_base_64": base64.b64encode(chunk).decode()}
+            if is_first:
+                payload["previous_text"] = "Safety monitoring conversation"
+                is_first = False
 
-    # write to an in-memory WAV file
-    buffer = io.BytesIO()
-    wf = wave.open(buffer, "wb")
-    
-    wf.setnchannels(CHANNELS)
-    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-    wf.setframerate(SAMPLE_RATE)
-    wf.writeframes(b"".join(frames))
-    wf.close()
+            await _connection.send(payload)
 
-    return buffer.getvalue()
+            now = asyncio.get_event_loop().time()
+            if now - last_commit >= COMMIT_INTERVAL:
+                await _connection.commit()
+                last_commit = now
 
-def check_voice(client):
-    audio_bytes = record_audio()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await _connection.close()
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
 
-    response = client.models.generate_content(
-        model=model,
-        contents = [
-                    'Listen to this audio. Does the person sound safe and okay? Consider tone, urgency and what they say. JSON only, no markdown: {"safe": true/false, "reason": "brief explanation"}',
-                    types.Part.from_bytes(
-                        data = audio_bytes,
-                        mime_type = "audio/wav"
-                    )
-                    ],
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-        )
-        
-    )
+def _run_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-    result = json.loads(response.text)
-    print(f"Voice check: {result}")
-    return result
+def start_voice():
+    global _loop
+    _loop = asyncio.new_event_loop()
+    threading.Thread(target=_run_loop, args=(_loop,), daemon=True).start()
+    asyncio.run_coroutine_threadsafe(_stream(), _loop)
+    print("Voice streaming started")
+
+def stop_voice():
+    global _loop
+    if _loop:
+        _loop.call_soon_threadsafe(_loop.stop)
+    print("Voice streaming stopped")
+
+def check_voice() -> dict:
+    """Returns the latest transcript from the continuous ElevenLabs stream."""
+    return {"transcript": latest_transcript}
 
 if __name__ == "__main__":
-
-    # check audio recording only first
-    # audio_bytes = record_audio()
-    # with open("test_recording.wav", "wb") as f:
-    #     f.write(audio_bytes)
-    # print("Saved to test_recording.wav")
-
-    # check both componens
-    check_voice()
-    print("checked")
-
+    import time
+    start_voice()
+    for _ in range(30):
+        time.sleep(1)
+        print(f"Latest: {latest_transcript}")
+    stop_voice()

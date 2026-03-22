@@ -8,23 +8,29 @@ class BuddyEyes:
         self.root = tk.Tk()
         self.root.title("Buddy Alert")
         self.root.configure(bg="black")
-        self.root.geometry("400x200")
-        self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)  # always on top
 
+        # get screen dimensions
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        # top right quadrant
+        win_w = screen_w // 2
+        win_h = screen_h // 2
+        x = screen_w // 2  # start at halfway across
+        y = 0              # top of screen
+
+        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
 
         self.canvas = tk.Canvas(
-            self.root, width=400, height=200,
+            self.root, width=win_w, height=win_h,
             bg="black", highlightthickness=0
         )
         self.canvas.pack()
 
-        # State: "safe", "warning", "alert"
         self.state = "safe"
-        self.blink = False
-        self.t = 0  # animation tick
-
-        self.after_id = None
+        self.t = 0
         self._draw()
 
     def set_state(self, state):
@@ -89,17 +95,23 @@ class BuddyEyes:
         self.canvas.delete("all")
         self.t += 1
 
-        # Blink every ~120 ticks
-        blinking = (self.t % 120) < 4
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
 
-        # Alert state — rapid flicker
+        blink_cycle = self.t % 150
+        if blink_cycle < 8:
+            blink_frac = math.sin(blink_cycle / 8 * math.pi)
+        else:
+            blink_frac = 0
+
         if self.state == "alert":
-            blinking = (self.t % 10) < 2
+            blink_frac = max(blink_frac, math.sin((self.t % 20) / 20 * math.pi) * 0.6)
 
-        self._draw_eye(110, 100, blinking)
-        self._draw_eye(290, 100, blinking)
+        # position eyes at 1/3 and 2/3 across, centred vertically
+        self._draw_eye(w // 3,     h // 2, blink_frac)
+        self._draw_eye(w // 3 * 2, h // 2, blink_frac)
 
-        self.after_id = self.root.after(30, self._draw)  # ~33fps
+        self.root.after(30, self._draw)
 
     def run(self):
         self.root.mainloop()

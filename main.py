@@ -1,53 +1,86 @@
-# 14/03/2026
+# 21/03/2026
 from dotenv import load_dotenv
 import os
-
 import time
 import threading
+import cv2
+from pynput import keyboard
+
+
 from google import genai
 from google.genai import types
 
-from camera import check_camera
-from voice import check_voice
-from alarm import play_alarm, play_chime
+from camera import start_camera, stop_camera, check_camera, get_latest_frame
+from voice import start_voice, stop_voice, check_voice
+from alarm import play_alarm
 from email_alert import send_alert_email
-
 from eyes import start_eyes, set_eye_state, stop_eyes
-from voice_prompt import speak
+from voice_prompt import speak, stop as stop_voice_prompt
+from log_window import start_log_window, stop_log_window
 
+
+stop_event = threading.Event()
+
+def _on_press(key):
+    try:
+        if key.char == 'q':  # press q to quit
+            print("Kill key pressed — shutting down...")
+            stop_event.set()
+    except AttributeError:
+        pass  # special key, ignore
+
+def start_kill_key():
+    listener = keyboard.Listener(on_press=_on_press)
+    listener.daemon = True
+    listener.start()
 
 load_dotenv()
-model =  os.getenv("MODEL")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))
+MODEL          = os.getenv("MODEL")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 5))
+STILLNESS_SECS = 5
+NO_SPEECH_SECS = 5
 
-SYSTEM_PROMPT = """You are a safety monitoring agent. Every cycle you must:
-1. Always check the camera first.
-2. If the camera result is uncertain OR unsafe OR if no person is present, flag STATUS:WARNING  AND also check voice.
-3. If both checks fail, flag STATUS:ALERT AND play the alarm AND send an alert email explaining why.
-4. If everything is fine, report that all is well and safe.
-Be decisive. Always use at least the camera tool each cycle.
-Always end your final response with exactly one of these words on its own line:
+alert_sent = False
+
+SAFE_KEYWORDS = [
+    "fine", "okay", "ok", "good", "yes",
+    "all good", "i'm fine", "im fine", "safe",
+    "bueno", "bom"
+]
+
+DISTRESS_KEYWORDS = [
+    "ow", "ouch", "help", "hurt", "pain", "stop",
+    "shit", "fuck", "damn", "christ", "jesus", "epa", "tsc",
+    "shite", "god", "mau", "ai", "fogo"
+]
+
+SYSTEM_PROMPT = """You are a safety assessment agent. You will receive a camera frame 
+and a voice transcript. Assess whether the person is safe or in distress.
+If you determine the person is in danger or unresponsive, use the send_alert_email 
+tool to notify their guardian with a clear explanation.
+If it's not possible to ascertain their safety, or the assessment is inconclsive, send
+the email anyways. It's better to be cautious.
+Always end your response with exactly one of:
 STATUS:SAFE, STATUS:WARNING, or STATUS:ALERT"""
 
-def check_camera_wrapped() -> dict:
-    """Captures a webcam frame and returns whether a person is visible and appears safe."""
-    result = check_camera(client)
-    if result.get("present") and result.get("safe"):
-        threading.Thread(target=play_chime, daemon=True).start()
-    return result
 
-def check_voice_wrapped() -> dict:
-    """Records audio and determines if the person sounds safe based on tone and words."""
+def contains_keyword(transcript, keywords):
+    t = transcript.lower()
+    return any(kw in t for kw in keywords)
+
+
+def frame_to_bytes(frame):
+    _, buffer = cv2.imencode('.jpg', frame)
+    return buffer.tobytes()
+
+
+def prompt_voice_check():
     set_eye_state("warning")
-    threading.Thread(target=speak, args=("Please confirm you are okay",), daemon=True).start()
+    threading.Thread(
+        target=speak, args=("Please confirm you are okay",), daemon=True
+    ).start()
 
-    return check_voice(client)
-
-def play_alarm_wrapped() -> dict:
-    """Plays a loud alarm sound on this computer."""
-    threading.Thread(target=play_alarm, daemon=True).start()
-    return {"status": "alarm started"}
 
 def send_alert_email_wrapped(reason: str) -> dict:
     """Sends an emergency alert email to the configured guardian.
@@ -55,82 +88,169 @@ def send_alert_email_wrapped(reason: str) -> dict:
     Args:
         reason: Brief explanation of why the alert is being sent.
     """
-    set_eye_state("alert")
-    send_alert_email(reason)
-    return {"status": "email sent"}
+    global alert_sent
+    if not alert_sent:
+        set_eye_state("alert")
+        frame = get_latest_frame()
+        send_alert_email(reason, frame=frame)
+        alert_sent = True
+        print(f"  Alert email sent: {reason}")
+        return {"status": "email sent"}
+    return {"status": "email already sent"}
 
-def dispatch_tool(function_call):
-    name = function_call.name
-    args = dict(function_call.args) if function_call.args else {}
 
+def call_gemini(client, camera_result, transcript):
+    print("  → Calling Gemini for safety assessment...")
 
-    tool_map = {
-        "check_camera_wrapped": check_camera_wrapped,
-        "check_voice_wrapped": check_voice_wrapped,
-        "play_alarm_wrapped": play_alarm_wrapped,
-        "send_alert_email_wrapped": send_alert_email_wrapped,
-    }
+    # build contents — frame + text description
+    contents = []
+    frame = get_latest_frame()
+    if frame is not None:
+        contents.append(types.Part.from_bytes(
+            data=frame_to_bytes(frame),
+            mime_type="image/jpeg"
+        ))
 
-    if name in tool_map:
-        print(f"  → Calling {name}...")
-        result = tool_map[name](**args)
-        print(f"  ← {result}")
-        return result
-    else:
-        return {"error": f"Unknown tool: {name}"}
+    contents.append(types.Part.from_text(text=
+        f"Camera: {camera_result.get('description', 'No description')}\n"
+        f"Voice transcript: '{transcript}'\n"
+        f"Motion detected: {camera_result.get('moving', 'unknown')}\n"
+        f"Pose safe: {camera_result.get('pose_safe', 'unknown')}"
+    ))
 
-def run_agent_cycle(chat):
-    response = chat.send_message("Run your safety check now.")
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[send_alert_email_wrapped],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+    )
 
+    response = client.models.generate_content(
+        model=MODEL,
+        config=config,
+        contents=contents
+    )
+
+    # agentic loop — handle tool calls
     while True:
         function_calls = response.function_calls
 
         if not function_calls:
             text = response.text
+            print(f"  Gemini: {text}")
             if "STATUS:ALERT" in text:
                 set_eye_state("alert")
+                threading.Thread(target=play_alarm, daemon=True).start()
+                return "alert"
             elif "STATUS:WARNING" in text:
                 set_eye_state("warning")
+                return "warning"
             else:
                 set_eye_state("safe")
-            print(f"Agent: {text}")
-            break
+                return "safe"
 
         tool_response_parts = []
         for fc in function_calls:
-            result = dispatch_tool(fc)
+            name = fc.name
+            args = dict(fc.args) if fc.args else {}
+            print(f"  → Calling {name}...")
+            if name == "send_alert_email_wrapped":
+                result = send_alert_email_wrapped(**args)
+            else:
+                result = {"error": f"Unknown tool: {name}"}
+            print(f"  ← {result}")
             tool_response_parts.append(
                 types.Part.from_function_response(
-                    name=fc.name,
+                    name=name,
                     response={"result": result}
                 )
             )
 
-        response = chat.send_message(tool_response_parts)
+        # feed tool results back
+        contents = contents + [
+            types.Part.from_function_response(
+                name=fc.name,
+                response={"result": {}}
+            ) for fc in function_calls
+        ] + tool_response_parts
+
+        response = client.models.generate_content(
+            model=MODEL,
+            config=config,
+            contents=contents
+        )
 
 
+def run_check(client):
+    global alert_sent
+
+    camera     = check_camera()
+    transcript = check_voice().get("transcript", "")
+    present    = camera.get("present", False)
+    moving     = camera.get("moving", True)
+    seconds_still = camera.get("seconds_still", 0)
+
+    print(f"  Camera: present={present} moving={moving} still={seconds_still}s")
+    print(f"  Transcript: '{transcript}'")
+
+    # case 1 — person present and moving
+    if present and moving:
+        if contains_keyword(transcript, DISTRESS_KEYWORDS):
+            set_eye_state("warning")
+            print("Distress keyword detected — calling Gemini")
+            call_gemini(client, camera, transcript)
+        else:
+            set_eye_state("safe")
+            print("Safe — person present and moving")
+            alert_sent = False
+        return
+
+    # case 2 — no person OR person not moved for STILLNESS_SECS
+    if not present or seconds_still >= STILLNESS_SECS:
+        set_eye_state("warning")
+        reason = "No person in frame" if not present else f"No movement for {seconds_still}s"
+        print(f"{reason} — prompting voice check")
+        prompt_voice_check()
+        time.sleep(NO_SPEECH_SECS)
+
+        # re-read transcript after waiting
+        transcript = check_voice().get("transcript", "")
+        print(f"  Post-prompt transcript: '{transcript}'")
+
+        if contains_keyword(transcript, SAFE_KEYWORDS):
+            print("Voice confirmed safe")
+            set_eye_state("safe")
+            alert_sent = False
+        elif contains_keyword(transcript, DISTRESS_KEYWORDS):
+            set_eye_state("warning")
+            print("Distress keyword detected — calling Gemini")
+            call_gemini(client, camera, transcript)
+        else:
+            set_eye_state("warning")
+            print("No response — calling Gemini")
+            call_gemini(client, camera, transcript)
 
 
 if __name__ == "__main__":
-    # start the eyes
     threading.Thread(target=start_eyes, daemon=True).start()
-    time.sleep(0.5)
+    threading.Thread(target=start_log_window, daemon=True).start()
+    start_camera()
+    start_voice()
+    start_kill_key()
+    time.sleep(1)
 
     with genai.Client() as client:
-        chat = client.chats.create(
-            model=model,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=[check_camera_wrapped, check_voice_wrapped, play_alarm_wrapped, send_alert_email_wrapped],
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-
-            ))
+        print("Buddy Alert started. Press Q to stop.\n")
         try:
-            while True:
-                print("--- New cycle ---")
-                run_agent_cycle(chat)
+            while not stop_event.is_set():
+                print("--- Check ---")
+                run_check(client)
                 time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             print("\nStopped.")
         finally:
+            stop_camera()
+            stop_voice()
+            stop_voice_prompt()
             stop_eyes()
+            stop_log_window()
+            print("Shutdown complete.")
